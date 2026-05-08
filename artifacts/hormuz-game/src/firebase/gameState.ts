@@ -4,15 +4,18 @@ import {
 } from "firebase/firestore";
 import { db } from "./config";
 
-// ── Player document ───────────────────────────────────────────────────────────
 export interface PlayerDoc {
   uid: string;
   displayName: string;
   photoURL: string | null;
   x: number; y: number; rotation: number;
+  vx?: number; vy?: number;
+  savedAt?: number;
   transits: number; color: string;
   xp: number;
   reputation: number;
+  selectedFlag?: string;
+  selectedFlagCode?: string;
   lastSeen?: unknown;
 }
 
@@ -48,7 +51,6 @@ export function subscribeToAllPlayers(callback: (players: PlayerDoc[]) => void):
   });
 }
 
-// ── Chat history (Firestore) ──────────────────────────────────────────────────
 export interface ChatRecord {
   uid: string; name: string; flag: string; text: string; ts?: unknown;
   isFuelRequest?: boolean;

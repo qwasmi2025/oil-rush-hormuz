@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Hormuz Strait Navigator"
+version = "1.0.0"
+id = "artifacts/hormuz-game"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25865
+
+[services.development]
+run = "pnpm --filter @workspace/hormuz-game run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/hormuz-game", "run", "build" ]
+publicDir = "artifacts/hormuz-game/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25865"
+BASE_PATH = "/"

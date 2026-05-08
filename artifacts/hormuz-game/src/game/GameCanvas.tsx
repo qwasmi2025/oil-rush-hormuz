@@ -6,9 +6,15 @@ import {
   savePlayerState, loadPlayerState, subscribeToAllPlayers,
   colorFromUid, type PlayerDoc,
 } from "@/firebase/gameState";
-import { detectNation, type Nation } from "./nations";
+import { detectNation, mapCountry, type Nation } from "./nations";
 import Chat from "@/components/Chat";
+import FlagSelector from "@/components/FlagSelector";
+import QuestPanel from "@/components/QuestPanel";
 import { getLevelInfo, type ComputedLevel, XP_TRANSIT, XP_OIL, XP_FUEL_GIVEN, REP_TRANSIT, REP_OIL, REP_FUEL_GIVEN } from "./levels";
+import {
+  loadQuestState, saveQuestState, updateQuestProgress,
+  type QuestState, type Quest,
+} from "./quests";
 import {
   MAP_WIDTH, MAP_HEIGHT, SHIP_LENGTH, SHIP_WIDTH,
   MAX_SPEED, REVERSE_SPEED, ACCELERATION, DRAG,
@@ -82,7 +88,6 @@ export default function GameCanvas({ user }: Props) {
   const coastGuardRef = useRef<CoastGuardState | null>(null);
   const gameEventRef = useRef<GameEvent | null>(null);
 
-  const keysRef = useRef<Set<string>>(new Set());
   const camRef = useRef({ x: MAP_WIDTH/2 - 640, y: MAP_HEIGHT/2 - 360 });
   const angularVelRef = useRef(0);
   const rafRef = useRef<number>(0);
@@ -101,7 +106,6 @@ export default function GameCanvas({ user }: Props) {
   const xpRef = useRef(0);
   const reputationRef = useRef(0);
   const levelInfoRef = useRef<ComputedLevel>(getLevelInfo(0));
-  // Set of remote player UIDs with low fuel (for canvas icon)
   const lowFuelUidsRef = useRef<Set<string>>(new Set());
   const fuelLowEmittedRef = useRef(false);
 
@@ -119,6 +123,8 @@ export default function GameCanvas({ user }: Props) {
   const mouseOnLandRef = useRef(false);
   const hoveredShipRef = useRef(false);
   const annIdRef = useRef(0);
+  // Track money earned this session for quests
+  const sessionEarnedRef = useRef(0);
 
   // React state (UI)
   const [playerCount, setPlayerCount] = useState(1);
@@ -144,6 +150,13 @@ export default function GameCanvas({ user }: Props) {
   const [xp, setXp] = useState(0);
   const [reputation, setReputation] = useState(0);
   const [levelInfo, setLevelInfo] = useState<ComputedLevel>(getLevelInfo(0));
+  // UI panel toggles
+  const [showQuests, setShowQuests] = useState(false);
+  const [showLeaderboard, setShowLeaderboard] = useState(false);
+  const [showFlagSelector, setShowFlagSelector] = useState(false);
+  const [selectedFlag, setSelectedFlag] = useState<string | null>(null);
+  // Quest state
+  const [questState, setQuestState] = useState<QuestState>(() => loadQuestState());
 
   const addAnn = useCallback((text: string) => {
     const id = annIdRef.current++;
@@ -168,6 +181,32 @@ export default function GameCanvas({ user }: Props) {
     detectNation().then(n => { nationRef.current = n; setNation(n); addAnn(`${n.flag} ${n.name} — ${n.bonusLabel}`); });
   }, [addAnn]);
 
+  // Load saved flag preference from localStorage
+  useEffect(() => {
+    const saved = localStorage.getItem("oilrush_flag");
+    if (saved) {
+      try {
+        const { flag, code } = JSON.parse(saved) as { flag: string; code: string };
+        setSelectedFlag(flag);
+        const updatedNation = mapCountry(code, flag);
+        updatedNation.flag = flag;
+        nationRef.current = { ...updatedNation, flag };
+        setNation({ ...updatedNation, flag });
+      } catch { /* ignore */ }
+    }
+  }, []);
+
+  const handleFlagSelect = useCallback((flag: string, code: string) => {
+    setSelectedFlag(flag);
+    localStorage.setItem("oilrush_flag", JSON.stringify({ flag, code }));
+    const updatedNation = mapCountry(code, code);
+    const nation = { ...updatedNation, flag };
+    nationRef.current = nation;
+    setNation(nation);
+    socketRef.current?.emit("player:flag_change", { flag });
+    addAnn(`${flag} Flag updated!`);
+  }, [addAnn]);
+
   // Firestore ghost ships + leaderboard
   useEffect(() => {
     const unsub = subscribeToAllPlayers(players => {
@@ -179,6 +218,16 @@ export default function GameCanvas({ user }: Props) {
     });
     return unsub;
   }, []);
+
+  // Quest helper
+  const progressQuest = useCallback((type: Quest["type"], amount = 1) => {
+    setQuestState(prev => {
+      const { newState, newlyCompleted } = updateQuestProgress(prev, type, amount);
+      saveQuestState(newState);
+      for (const q of newlyCompleted) addAnn(`🎯 Quest done: ${q.title}! Tap Quests to claim.`);
+      return newState;
+    });
+  }, [addAnn]);
 
   // ── Canvas + socket init ───────────────────────────────────────────────────
   useEffect(() => {
@@ -197,22 +246,15 @@ export default function GameCanvas({ user }: Props) {
     if (offCtx) drawMap(offCtx);
     offscreenRef.current = offscreen;
 
-    // Keyboard
+    // Keyboard: zoom only — movement is click-to-move only
     const onKey = (e: KeyboardEvent) => {
-      const k = e.key.toLowerCase();
-      const isMove = ["w","a","s","d","arrowup","arrowdown","arrowleft","arrowright"].includes(k);
-      if (isMove) {
-        e.preventDefault();
-        if (e.type === "keydown") { keysRef.current.add(k); clickTargetRef.current = null; }
-        else keysRef.current.delete(k);
-      }
       if (e.type === "keydown") {
-        if (k==="="||k==="+"||k==="pageup") { targetZoomRef.current = Math.min(ZOOM_MAX, targetZoomRef.current+ZOOM_STEP); }
-        if (k==="-"||k==="pagedown") { const minZ = getDynMinZoom(canvas); targetZoomRef.current = Math.max(minZ, targetZoomRef.current-ZOOM_STEP); }
+        const k = e.key.toLowerCase();
+        if (k==="="||k==="+"||k==="pageup") { e.preventDefault(); targetZoomRef.current = Math.min(ZOOM_MAX, targetZoomRef.current+ZOOM_STEP); }
+        if (k==="-"||k==="pagedown") { e.preventDefault(); const minZ = getDynMinZoom(canvas); targetZoomRef.current = Math.max(minZ, targetZoomRef.current-ZOOM_STEP); }
       }
     };
     window.addEventListener("keydown", onKey);
-    window.addEventListener("keyup", onKey);
 
     // Mouse click-to-move
     const onClick = (e: MouseEvent) => {
@@ -232,7 +274,7 @@ export default function GameCanvas({ user }: Props) {
     };
     canvas.addEventListener("wheel", onWheel, { passive: false });
 
-    // Touch: single touch = click-to-move, two-finger pinch = zoom
+    // Touch: single tap = click-to-move, two-finger pinch = zoom
     const onTouchStart = (e: TouchEvent) => {
       e.preventDefault();
       if (e.touches.length === 1) {
@@ -307,12 +349,10 @@ export default function GameCanvas({ user }: Props) {
       setHoverInfo(found);
       if (found) setHoverPos({ x: e.clientX, y: e.clientY });
 
-      // Map hover: distance + ETA for any water position
       if (!found && !onLand && s) {
         const d = dist2(s.x, s.y, wx, wy);
         const distKm = parseFloat((d * PX_TO_KM).toFixed(1));
         const curSpd = Math.sqrt(s.vx ** 2 + s.vy ** 2);
-        // Use current speed if moving, otherwise estimate at cruise (70 % of max)
         const speedPxSec = Math.max(curSpd, MAX_SPEED * 0.7) * 60;
         const secs = Math.round(d / speedPxSec);
         const eta = secs < 60 ? `${secs}s` : `${Math.floor(secs / 60)}m ${secs % 60}s`;
@@ -325,7 +365,14 @@ export default function GameCanvas({ user }: Props) {
 
     const onUnload = () => {
       const s = selfRef.current; if (!s) return;
-      savePlayerState(user.uid, { displayName:user.displayName??"", photoURL:user.photoURL, x:s.x, y:s.y, rotation:s.rotation, transits:s.transits, color:myColorRef.current, xp:xpRef.current, reputation:reputationRef.current });
+      savePlayerState(user.uid, {
+        displayName:user.displayName??"", photoURL:user.photoURL,
+        x:s.x, y:s.y, rotation:s.rotation, vx:s.vx, vy:s.vy,
+        savedAt: Date.now(),
+        transits:s.transits, color:myColorRef.current,
+        xp:xpRef.current, reputation:reputationRef.current,
+        selectedFlag: nationRef.current?.flag, selectedFlagCode: nationRef.current?.code,
+      });
     };
     window.addEventListener("beforeunload", onUnload);
 
@@ -334,12 +381,31 @@ export default function GameCanvas({ user }: Props) {
       if (saved?.color) myColorRef.current = saved.color;
       if (saved?.xp) { xpRef.current=saved.xp; setXp(saved.xp); const li=getLevelInfo(saved.xp); levelInfoRef.current=li; setLevelInfo(li); }
       if (saved?.reputation) { reputationRef.current=saved.reputation; setReputation(saved.reputation); }
+      // Restore saved flag preference
+      if (saved?.selectedFlag && saved?.selectedFlagCode) {
+        const restoredNation = mapCountry(saved.selectedFlagCode, saved.selectedFlagCode);
+        const n = { ...restoredNation, flag: saved.selectedFlag };
+        nationRef.current = n; setNation(n); setSelectedFlag(saved.selectedFlag);
+      }
+
       const socketAuth: Record<string, unknown> = {
         uid: user.uid, name: user.displayName??"Navigator",
         photoURL: user.photoURL??null, color: myColorRef.current,
         transits: saved?.transits??0, flag: nationRef.current?.flag??"🏳️",
       };
-      if (saved) { socketAuth.x=saved.x; socketAuth.y=saved.y; socketAuth.rotation=saved.rotation; }
+      if (saved) {
+        // Project position forward based on last velocity and time elapsed
+        let projX = saved.x, projY = saved.y;
+        if (saved.vx != null && saved.vy != null && saved.savedAt) {
+          const elapsedSec = Math.min((Date.now() - saved.savedAt) / 1000, 30);
+          const frames = elapsedSec * 60;
+          // Geometric series: sum of DRAG^k for k=0..frames ≈ (1-DRAG^frames)/(1-DRAG)
+          const decay = (1 - Math.pow(DRAG, frames)) / (1 - DRAG);
+          projX = Math.max(4, Math.min(MAP_WIDTH-4, saved.x + saved.vx * decay));
+          projY = Math.max(4, Math.min(MAP_HEIGHT-4, saved.y + saved.vy * decay));
+        }
+        socketAuth.x=projX; socketAuth.y=projY; socketAuth.rotation=saved.rotation;
+      }
 
       const socket = io({ path: "/socket.io", auth: socketAuth });
       socketRef.current = socket;
@@ -388,13 +454,13 @@ export default function GameCanvas({ user }: Props) {
       socket.on("player:transited", (d: {id:string;uid:string;name:string;transits:number}) => {
         if (socket.id===d.id) {
           setMyTransits(d.transits);
-          // Award XP + reputation for transit
           xpRef.current+=XP_TRANSIT; reputationRef.current+=REP_TRANSIT;
           setXp(xpRef.current); setReputation(reputationRef.current);
           const li=getLevelInfo(xpRef.current); const prevLvl=levelInfoRef.current.level;
           levelInfoRef.current=li; setLevelInfo(li);
           if (li.level>prevLvl) addAnn(`🎖️ Level Up! ${li.badge} ${li.title} (${li.titleAr})`);
-          const s=selfRef.current; if(s) { s.transits=d.transits; savePlayerState(user.uid,{displayName:user.displayName??"",photoURL:user.photoURL,x:s.x,y:s.y,rotation:s.rotation,transits:d.transits,color:myColorRef.current,xp:xpRef.current,reputation:reputationRef.current}); }
+          const s=selfRef.current; if(s) { s.transits=d.transits; savePlayerState(user.uid,{displayName:user.displayName??"",photoURL:user.photoURL,x:s.x,y:s.y,rotation:s.rotation,vx:s.vx,vy:s.vy,savedAt:Date.now(),transits:d.transits,color:myColorRef.current,xp:xpRef.current,reputation:reputationRef.current}); }
+          progressQuest("transit");
         }
         addAnn(`✓ ${d.name} completed transit #${d.transits}! (+${XP_TRANSIT} XP)`);
       });
@@ -425,8 +491,6 @@ export default function GameCanvas({ user }: Props) {
         if (event) applyEvent(event); else clearEvent();
       });
 
-      // ── Fuel transfer ──────────────────────────────────────────────────────
-      // ── Fuel low indicators for remote ships ─────────────────────────────────
       socket.on("player:fuel_low", ({ uid }: { uid: string }) => { lowFuelUidsRef.current.add(uid); });
       socket.on("player:fuel_ok",  ({ uid }: { uid: string }) => { lowFuelUidsRef.current.delete(uid); });
 
@@ -452,17 +516,19 @@ export default function GameCanvas({ user }: Props) {
         moneyRef.current += payment;
         setMoney(moneyRef.current);
         setIncomingFuelReq(null);
-        // Award XP + reputation for helping with fuel
         xpRef.current+=XP_FUEL_GIVEN; reputationRef.current+=REP_FUEL_GIVEN;
         setXp(xpRef.current); setReputation(reputationRef.current);
         const li=getLevelInfo(xpRef.current); const prevLvl=levelInfoRef.current.level;
         levelInfoRef.current=li; setLevelInfo(li);
         if (li.level>prevLvl) addAnn(`🎖️ Level Up! ${li.badge} ${li.title}`);
         addAnn(`⛽ Sent ${amount} fuel — earned $${payment} · +${XP_FUEL_GIVEN} XP`);
+        progressQuest("fuel_give");
       });
       socket.on("fuel:request_declined",  () => { setOutgoingFuelReq(null); addAnn("⛽ Fuel request declined"); });
       socket.on("fuel:request_expired",   () => { setOutgoingFuelReq(null); addAnn("⛽ Fuel request expired"); });
       socket.on("fuel:request_failed",    (d?: {reason?:string}) => { setOutgoingFuelReq(null); addAnn(`⛽ ${d?.reason ?? "No players nearby"}`); });
+
+      socket.on("chat:message", () => { /* handled by Chat component */ });
     });
 
     function applyEvent(e: GameEvent) {
@@ -479,7 +545,6 @@ export default function GameCanvas({ user }: Props) {
     return () => {
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onKey);
-      window.removeEventListener("keyup",   onKey);
       window.removeEventListener("beforeunload", onUnload);
       canvas.removeEventListener("click",       onClick);
       canvas.removeEventListener("wheel",       onWheel);
@@ -502,7 +567,6 @@ export default function GameCanvas({ user }: Props) {
     if (!ctxRaw) return;
     const ctx: CanvasRenderingContext2D = ctxRaw;
 
-    // ── Drawing helpers ──────────────────────────────────────────────────────
     function drawWake(wake: {x:number;y:number;age:number}[]) {
       if (wake.length<2) return;
       for (let i=1;i<wake.length;i++) {
@@ -533,7 +597,7 @@ export default function GameCanvas({ user }: Props) {
       ctx.fillStyle="rgba(255,255,255,0.14)";
       ctx.beginPath(); ctx.moveTo(L/2-1,0); ctx.lineTo(L/4,-W/4); ctx.lineTo(-L/4,-W/4); ctx.lineTo(-L/4,0); ctx.closePath(); ctx.fill();
       ctx.fillStyle="rgba(255,255,255,0.55)"; ctx.fillRect(-5,-1.5,13,3);
-      if (speed>0.25&&!frozen) {
+      if (speed>0.01&&!frozen) {
         ctx.save(); ctx.globalAlpha=Math.min(speed/MAX_SPEED,1)*0.42;
         ctx.strokeStyle="rgba(200,230,255,0.8)"; ctx.lineWidth=1.5;
         const ws=Math.min(speed*4,W*0.7), wl=Math.min(speed*14,L);
@@ -541,14 +605,12 @@ export default function GameCanvas({ user }: Props) {
         ctx.restore();
       }
       ctx.globalAlpha=1; ctx.restore();
-      // Labels
       ctx.save(); ctx.font="bold 11px 'Courier New',monospace"; ctx.textAlign="center";
       ctx.fillStyle="rgba(0,0,0,0.45)"; ctx.fillText(name,x+1,y-L/2-8);
       ctx.fillStyle=isSelf?"rgba(255,255,200,0.95)":"rgba(200,230,255,0.85)"; ctx.fillText(name,x,y-L/2-9);
       if (flag&&flag!=="🏳️") { ctx.font="14px serif"; ctx.fillText(flag,x-12,y-L/2-23); }
       if (levelBadge) { ctx.font="12px serif"; ctx.fillText(levelBadge,x+(flag&&flag!=="🏳️"?4:0),y-L/2-22); }
       if (transits>0) { ctx.font="bold 10px monospace"; ctx.fillStyle="#4ade80"; ctx.fillText(`✓${transits}`,x+16,y-L/2-22); }
-      // Fuel low indicator — blinking ⛽ above ship
       if (isLowFuel) {
         const blink = Math.sin(Date.now()/240)*0.5+0.6;
         ctx.globalAlpha=blink; ctx.font="13px serif"; ctx.fillText("⛽",x,y-L/2-37); ctx.globalAlpha=1;
@@ -634,70 +696,40 @@ export default function GameCanvas({ user }: Props) {
       const stormMult=stormRef.current?0.68:1.0;
 
       if (!frozen) {
-        const k=keysRef.current;
-        const fwd  = k.has("w")||k.has("arrowup")    ? 1 : k.has("s")||k.has("arrowdown")  ? -1 : 0;
-        const turn = k.has("d")||k.has("arrowright")  ? 1 : k.has("a")||k.has("arrowleft") ? -1 :  0;
-        const hasKeys = fwd!==0||turn!==0;
+        // Click-to-move only (no keyboard movement)
+        const ct=clickTargetRef.current;
+        if (ct) {
+          const dx=ct.x-s.x, dy=ct.y-s.y;
+          const d=Math.sqrt(dx*dx+dy*dy);
+          const currentSpd=Math.sqrt(s.vx**2+s.vy**2);
 
-        if (hasKeys) {
-          // Clear click target when using keyboard
-          if (turn) {
-            angularVelRef.current += turn * ROTATION_SPEED;
-          }
-          angularVelRef.current *= ANGULAR_DRAG;
-          s.rotation += angularVelRef.current;
-
-          if (fwd && fuelRef.current > 0) {
-            const maxSpd = (fwd>0?MAX_SPEED:REVERSE_SPEED)*speedMult*stormMult;
-            s.vx += Math.cos(s.rotation)*ACCELERATION*fwd;
-            s.vy += Math.sin(s.rotation)*ACCELERATION*fwd;
-            const spd=Math.sqrt(s.vx**2+s.vy**2);
-            if (spd>maxSpd) { s.vx=(s.vx/spd)*maxSpd; s.vy=(s.vy/spd)*maxSpd; }
-          }
-        } else {
-          // Click-to-move: realistic deceleration-aware approach
-          const ct=clickTargetRef.current;
-          if (ct) {
-            const dx=ct.x-s.x, dy=ct.y-s.y;
-            const d=Math.sqrt(dx*dx+dy*dy);
-            const currentSpd=Math.sqrt(s.vx**2+s.vy**2);
-
-            if (d < 18) {
-              clickTargetRef.current=null;
-              // Gentle braking: let drag handle it
-            } else {
-              // Steer toward target
-              const ta=Math.atan2(dy,dx);
-              let ad=ta-s.rotation;
-              while(ad>Math.PI) ad-=Math.PI*2; while(ad<-Math.PI) ad+=Math.PI*2;
-              // Proportional steering, gentle
-              const steer=Math.sign(ad)*Math.min(Math.abs(ad)*0.28, ROTATION_SPEED*1.4);
-              angularVelRef.current=lerp(angularVelRef.current, steer, 0.22);
-              angularVelRef.current*=ANGULAR_DRAG;
-              s.rotation+=angularVelRef.current;
-
-              // Throttle: only apply when facing roughly target
-              if (Math.abs(ad)<Math.PI*0.55 && fuelRef.current>0) {
-                // Approach speed — slow down as we get close
-                // Stopping distance at current speed: ~v / (1-DRAG) frames
-                const stoppingDist = (currentSpd / (1-DRAG)) * 0.5;
-                const targetSpd = d < stoppingDist*1.5
-                  ? Math.max(0, currentSpd - ACCELERATION*2)  // decelerate
-                  : Math.min(MAX_SPEED*speedMult*stormMult, d * 0.005); // proportional cruise
-                if (currentSpd < targetSpd) {
-                  s.vx+=Math.cos(s.rotation)*ACCELERATION;
-                  s.vy+=Math.sin(s.rotation)*ACCELERATION;
-                }
-              }
-            }
+          if (d < 18) {
+            clickTargetRef.current=null;
           } else {
-            // No input: let angular velocity decay naturally
+            const ta=Math.atan2(dy,dx);
+            let ad=ta-s.rotation;
+            while(ad>Math.PI) ad-=Math.PI*2; while(ad<-Math.PI) ad+=Math.PI*2;
+            const steer=Math.sign(ad)*Math.min(Math.abs(ad)*0.28, ROTATION_SPEED*1.4);
+            angularVelRef.current=lerp(angularVelRef.current, steer, 0.22);
             angularVelRef.current*=ANGULAR_DRAG;
             s.rotation+=angularVelRef.current;
+
+            if (Math.abs(ad)<Math.PI*0.55 && fuelRef.current>0) {
+              const stoppingDist = (currentSpd / (1-DRAG)) * 0.5;
+              const targetSpd = d < stoppingDist*1.5
+                ? Math.max(0, currentSpd - ACCELERATION*2)
+                : Math.min(MAX_SPEED*speedMult*stormMult, d * 0.005);
+              if (currentSpd < targetSpd) {
+                s.vx+=Math.cos(s.rotation)*ACCELERATION;
+                s.vy+=Math.sin(s.rotation)*ACCELERATION;
+              }
+            }
           }
+        } else {
+          angularVelRef.current*=ANGULAR_DRAG;
+          s.rotation+=angularVelRef.current;
         }
       } else {
-        // Frozen: coast to stop
         angularVelRef.current*=0.65; s.rotation+=angularVelRef.current;
       }
 
@@ -723,19 +755,18 @@ export default function GameCanvas({ user }: Props) {
 
       const speed=Math.sqrt(s.vx**2+s.vy**2);
 
-      // Fuel drain
-      if (speed>0.2&&!frozen) {
+      // Fuel drain — fixed threshold (was 0.2 which exceeded MAX_SPEED of 0.18)
+      if (speed>0.01&&!frozen) {
         const drain=FUEL_DRAIN*(nat?.fuelMult??1.0)*(stormRef.current?1.45:1.0);
         fuelRef.current=Math.max(0,fuelRef.current-drain);
         setFuel(Math.round(fuelRef.current));
-        // Broadcast fuel low/ok threshold to other players
         const isLow = fuelRef.current < 30;
         if (isLow && !fuelLowEmittedRef.current) { fuelLowEmittedRef.current=true; socketRef.current?.emit("player:fuel_low"); }
         if (!isLow && fuelLowEmittedRef.current) { fuelLowEmittedRef.current=false; socketRef.current?.emit("player:fuel_ok"); }
       }
 
       // Wake trail
-      if (++wakeTickRef.current%3===0&&speed>0.15) {
+      if (++wakeTickRef.current%3===0&&speed>0.01) {
         selfWakeRef.current.push({x:s.x,y:s.y,age:0});
         if (selfWakeRef.current.length>60) selfWakeRef.current.shift();
       }
@@ -767,13 +798,16 @@ export default function GameCanvas({ user }: Props) {
         const earned=Math.floor(oilBarrelsRef.current*oilPriceRef.current*(nat?.profitMult??1.0));
         moneyRef.current+=earned; setMoney(moneyRef.current);
         oilBarrelsRef.current=0; setOilBarrels(0);
-        // Award XP + reputation for delivery
         xpRef.current+=XP_OIL; reputationRef.current+=REP_OIL;
         setXp(xpRef.current); setReputation(reputationRef.current);
         const li=getLevelInfo(xpRef.current); const prevLvl=levelInfoRef.current.level;
         levelInfoRef.current=li; setLevelInfo(li);
         if (li.level>prevLvl) addAnn(`🎖️ Level Up! ${li.badge} ${li.title}`);
         addAnn(`💰 Delivered! +$${earned.toLocaleString()} · +${XP_OIL} XP`);
+        // Quest tracking
+        sessionEarnedRef.current += earned;
+        progressQuest("oil_deliver");
+        progressQuest("money_earn", earned);
       }
 
       // Fuel stations
@@ -801,7 +835,7 @@ export default function GameCanvas({ user }: Props) {
       }
       if (nowMs-lastSaveRef.current>30000) {
         lastSaveRef.current=nowMs;
-        savePlayerState(user.uid,{displayName:user.displayName??"",photoURL:user.photoURL,x:s.x,y:s.y,rotation:s.rotation,transits:s.transits,color:myColorRef.current,xp:xpRef.current,reputation:reputationRef.current});
+        savePlayerState(user.uid,{displayName:user.displayName??"",photoURL:user.photoURL,x:s.x,y:s.y,rotation:s.rotation,vx:s.vx,vy:s.vy,savedAt:Date.now(),transits:s.transits,color:myColorRef.current,xp:xpRef.current,reputation:reputationRef.current});
       }
 
       // Lerp remotes
@@ -822,13 +856,11 @@ export default function GameCanvas({ user }: Props) {
       const zoom=zoomRef.current;
       const viewW=W/zoom, viewH=H/zoom;
 
-      // Dynamic zoom min — prevent going outside map
       const minZ=getDynMinZoom(canvas);
       if (targetZoomRef.current<minZ) targetZoomRef.current=minZ;
 
       const tcx=s?s.x-viewW/2:MAP_WIDTH/2-viewW/2;
       const tcy=s?s.y-viewH/2:MAP_HEIGHT/2-viewH/2;
-      // Camera clamp (handle case where view > map dimension)
       const clampX=viewW>=MAP_WIDTH ? -(viewW-MAP_WIDTH)/2 : Math.max(0,Math.min(MAP_WIDTH-viewW,tcx));
       const clampY=viewH>=MAP_HEIGHT ? -(viewH-MAP_HEIGHT)/2 : Math.max(0,Math.min(MAP_HEIGHT-viewH,tcy));
       camRef.current.x=lerp(camRef.current.x,clampX,CAMERA_LERP);
@@ -839,7 +871,6 @@ export default function GameCanvas({ user }: Props) {
 
       if (offscreenRef.current) ctx.drawImage(offscreenRef.current,0,0);
 
-      // Animated wave shimmer
       ctx.save(); ctx.globalAlpha=0.048; ctx.strokeStyle="#5ab4ee"; ctx.lineWidth=1.4;
       for (let i=0;i<7;i++) {
         const wy=380+(i*(MAP_HEIGHT-760))/6, off=Math.sin(t*0.4+i*1.1)*10;
@@ -849,7 +880,6 @@ export default function GameCanvas({ user }: Props) {
       }
       ctx.globalAlpha=1; ctx.restore();
 
-      // Zones
       drawZone(START_ZONE,  START_COLOR,  START_BORDER_COLOR,  "START",     t);
       drawZone(FINISH_ZONE, FINISH_COLOR, FINISH_BORDER_COLOR, "FINISH",    t);
       drawZone(OIL_LOAD_ZONE,    OIL_COLOR,  OIL_BORDER_COLOR,  "🛢 OIL LOAD",  t);
@@ -862,63 +892,45 @@ export default function GameCanvas({ user }: Props) {
         ctx.fillText("⛽ FUEL",fs.x+fs.w/2,fs.y-6); ctx.restore();
       }
 
-      // Storm overlay
       if (stormRef.current) {
         ctx.save(); ctx.globalAlpha=0.07; ctx.fillStyle="#88ccff"; ctx.fillRect(0,0,MAP_WIDTH,MAP_HEIGHT);
         ctx.globalAlpha=1; ctx.restore();
       }
 
-      // Map hover cursor — dashed line + pulsing ring at mouse world position
       const mw = mouseWorldRef.current;
       if (s && !hoveredShipRef.current && !mouseOnLandRef.current) {
         const d = dist2(s.x, s.y, mw.x, mw.y);
         if (d > 20) {
-          // Dashed line from ship to cursor
           ctx.save();
-          ctx.globalAlpha = 0.28;
-          ctx.strokeStyle = "#facc15";
-          ctx.lineWidth = 1;
-          ctx.setLineDash([5, 7]);
-          ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(mw.x, mw.y); ctx.stroke();
-          ctx.setLineDash([]);
-          // Pulsing outer ring
+          ctx.globalAlpha = 0.28; ctx.strokeStyle = "#facc15"; ctx.lineWidth = 1; ctx.setLineDash([5, 7]);
+          ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(mw.x, mw.y); ctx.stroke(); ctx.setLineDash([]);
           const pulse = 0.55 + 0.35 * Math.sin(t * 5.5);
-          ctx.globalAlpha = pulse;
-          ctx.strokeStyle = "#facc15";
-          ctx.lineWidth = 1.5;
+          ctx.globalAlpha = pulse; ctx.strokeStyle = "#facc15"; ctx.lineWidth = 1.5;
           ctx.beginPath(); ctx.arc(mw.x, mw.y, 9 + Math.sin(t * 5.5) * 2.5, 0, Math.PI * 2); ctx.stroke();
-          // Inner dot
-          ctx.globalAlpha = 0.9;
-          ctx.fillStyle = "#facc15";
+          ctx.globalAlpha = 0.9; ctx.fillStyle = "#facc15";
           ctx.beginPath(); ctx.arc(mw.x, mw.y, 2.5, 0, Math.PI * 2); ctx.fill();
           ctx.restore();
         }
       }
 
-      // Click target indicator
       const ct=clickTargetRef.current;
       if (ct) drawClickTarget(ct.x,ct.y,t);
 
-      // Mines
       for (const m of minesRef.current) if (m.alive) drawMine(m.x,m.y);
 
-      // Ghost ships (offline players from Firestore)
       for (const [uid,ghost] of firestorePlayersRef.current) {
         if (liveUidsRef.current.has(uid)||uid===user.uid) continue;
         drawGhostShip(ghost.x,ghost.y,ghost.rotation,ghost.color,ghost.displayName,ghost.transits??0);
       }
 
-      // NPC bots
       for (const bot of botsRef.current) {
         drawShip(bot.x,bot.y,bot.rotation,bot.color,bot.name,0,bot.flag,false,bot.frozen?0:1.2,bot.frozen);
         ctx.save(); ctx.font="8px monospace"; ctx.textAlign="center"; ctx.fillStyle="rgba(255,140,0,0.55)";
         ctx.fillText("NPC",bot.x,bot.y+SHIP_LENGTH/2+8); ctx.restore();
       }
 
-      // Coast guard
       if (coastGuardRef.current) drawCoastGuard(coastGuardRef.current);
 
-      // Remote players' wakes then ships
       for (const r of remotesRef.current.values()) drawWake(r.wake);
       drawWake(selfWakeRef.current);
       for (const r of remotesRef.current.values()) {
@@ -926,7 +938,6 @@ export default function GameCanvas({ user }: Props) {
         drawShip(r.x,r.y,r.rotation,r.color,r.name,r.transits,r.flag??"🏳️",false,Math.sqrt(r.vx**2+r.vy**2),false,undefined,isRLowFuel);
       }
 
-      // Self ship
       if (s) {
         const frozen=Date.now()<frozenUntilRef.current;
         const selfLvlBadge=levelInfoRef.current.badge;
@@ -942,7 +953,7 @@ export default function GameCanvas({ user }: Props) {
         }
       }
 
-      ctx.restore(); // end zoom+camera
+      ctx.restore();
     }
 
     function loop(ts: number) { update(); render(ts/1000); rafRef.current=requestAnimationFrame(loop); }
@@ -958,7 +969,7 @@ export default function GameCanvas({ user }: Props) {
   }, [outgoingFuelReq]);
 
   const requestFuelNearest = useCallback(() => {
-    if (outgoingFuelReq) { return; }
+    if (outgoingFuelReq) return;
     socketRef.current?.emit("fuel:request_nearest");
   }, [outgoingFuelReq]);
 
@@ -967,137 +978,214 @@ export default function GameCanvas({ user }: Props) {
     setIncomingFuelReq(null);
   }, []);
 
+  const claimQuest = useCallback((quest: Quest) => {
+    setQuestState(prev => {
+      if (!prev.completed[quest.id] || prev.claimed[quest.id]) return prev;
+      const next = { ...prev, claimed: { ...prev.claimed, [quest.id]: true } };
+      saveQuestState(next);
+      // Apply rewards
+      xpRef.current += quest.xpReward;
+      setXp(xpRef.current);
+      const li = getLevelInfo(xpRef.current);
+      const prevLvl = levelInfoRef.current.level;
+      levelInfoRef.current = li; setLevelInfo(li);
+      if (li.level > prevLvl) addAnn(`🎖️ Level Up! ${li.badge} ${li.title}`);
+      if (quest.moneyReward > 0) { moneyRef.current += quest.moneyReward; setMoney(moneyRef.current); }
+      addAnn(`🎯 ${quest.title} claimed! +${quest.xpReward} XP${quest.moneyReward > 0 ? ` +$${quest.moneyReward}` : ""}`);
+      return next;
+    });
+  }, [addAnn]);
+
   const fuelColor = fuel > 60 ? "#4ade80" : fuel > 25 ? "#facc15" : "#f87171";
   const frozenSecsLeft = Math.max(0, Math.ceil((frozenUntil - Date.now()) / 1000));
+  const questsDone = Object.values(questState.completed).filter(Boolean).length;
+  const questsUnclaimed = Object.entries(questState.completed).filter(([id, done]) => done && !questState.claimed[id]).length;
+
+  const displayFlag = selectedFlag ?? nation?.flag ?? "🏳️";
 
   return (
     <div className="relative w-screen h-screen overflow-hidden bg-[#061629]">
       <canvas ref={canvasRef} className="absolute inset-0" style={{ cursor:"crosshair", touchAction:"none" }} />
 
-      {/* ── Main HUD ── */}
-      <div className="absolute top-3 left-3 bg-black/82 border border-white/15 rounded-lg px-4 py-3 text-white font-mono w-56 backdrop-blur-sm">
-        <div className="flex items-center gap-2 mb-2">
-          {user.photoURL && <img src={user.photoURL} alt="" className="w-7 h-7 rounded-full border-2 shrink-0" style={{borderColor:myColorRef.current}} />}
-          <div>
-            <div className="text-yellow-400 font-bold text-xs tracking-widest leading-none">HORMUZ · OIL RUSH</div>
-            {nation && <div className="text-white/40 text-[10px] mt-0.5">{nation.flag} {nation.name}</div>}
-          </div>
-        </div>
-        {nation && <div className="text-[10px] text-amber-400/80 mb-2 border border-amber-400/20 rounded px-2 py-1">{nation.bonusLabel}</div>}
-        {/* Level badge */}
-        <div className="flex items-center gap-2 mb-2 bg-white/5 rounded-lg px-2 py-1.5">
-          <span className="text-xl leading-none">{levelInfo.badge}</span>
-          <div className="flex-1 min-w-0">
-            <div className="text-[11px] font-bold" style={{ color: levelInfo.color }}>{levelInfo.title}</div>
-            <div className="text-[9px] text-white/35 truncate">{levelInfo.titleAr}</div>
-          </div>
-          <div className="text-right shrink-0">
-            <div className="text-[10px] text-cyan-300 font-bold">{xp} XP</div>
-            <div className="text-[9px] text-white/30">⭐{reputation}</div>
-          </div>
-        </div>
-        {/* XP progress bar */}
-        {levelInfo.xpToNext > 0 && (
-          <div className="mb-2">
-            <div className="flex justify-between text-[9px] text-white/30 mb-0.5">
-              <span>Level {levelInfo.level}</span>
-              <span>{levelInfo.xpToNext} XP to next</span>
-            </div>
-            <div className="h-1 bg-white/10 rounded-full overflow-hidden">
-              <div className="h-full rounded-full transition-all" style={{ width:`${Math.round(levelInfo.progress*100)}%`, backgroundColor: levelInfo.color }} />
-            </div>
-          </div>
-        )}
-        <div className="text-xs space-y-1.5">
-          {[
-            {label:"CAPTAIN", value:user.displayName??"Navigator", cls:"text-cyan-300 truncate max-w-[110px]"},
-            {label:"TRANSITS", value:myTransits, cls:"text-green-400 font-bold"},
-            {label:"ONLINE",   value:playerCount, cls:"text-blue-300"},
-            {label:"SIGNAL",   value:connected?"ONLINE":"OFFLINE", cls:connected?"text-green-400":"text-red-400"},
-          ].map(({label,value,cls})=>(
-            <div key={label} className="flex justify-between items-center gap-2">
-              <span className="text-white/35 text-[10px] tracking-wider shrink-0">{label}</span>
-              <span className={cls}>{String(value)}</span>
-            </div>
-          ))}
-        </div>
-        {/* Fuel bar */}
-        <div className="mt-2 pt-2 border-t border-white/10">
-          <div className="flex justify-between text-[10px] mb-1">
-            <span className="text-white/40">⛽ FUEL</span>
-            <span style={{color:fuelColor}}>{fuel}%</span>
-          </div>
-          <div className="h-2 bg-white/10 rounded-full overflow-hidden">
-            <div className="h-full rounded-full transition-all" style={{width:`${fuel}%`,backgroundColor:fuelColor}} />
-          </div>
-          {fuel < 20 && (
-            <div className="text-[10px] text-red-400 animate-pulse mt-1">⚠️ Low fuel — find ⛽ station or request from player</div>
+      {/* ── Full-width top HUD bar ── */}
+      <div className="absolute top-0 left-0 right-0 z-20 h-14 bg-black/90 border-b border-white/10 flex items-center px-3 gap-3 backdrop-blur-sm font-mono overflow-hidden">
+
+        {/* Logo */}
+        <div className="text-yellow-400 font-bold text-xs tracking-widest whitespace-nowrap hidden sm:block">⚓ OIL RUSH</div>
+        <div className="w-px h-8 bg-white/10 hidden sm:block" />
+
+        {/* Player identity */}
+        <div className="flex items-center gap-2 shrink-0">
+          {user.photoURL && (
+            <img src={user.photoURL} alt="" className="w-8 h-8 rounded-full border-2 shrink-0" style={{borderColor:myColorRef.current}} />
           )}
-        </div>
-        {/* Economy */}
-        <div className="mt-2 pt-2 border-t border-white/10 space-y-1">
-          {[
-            {label:"💰 MONEY",  value:`$${money.toLocaleString()}`,      cls:"text-yellow-300"},
-            {label:"🛢 CARGO",  value:`${oilBarrels}/${OIL_CARGO_MAX}`,  cls:"text-amber-400"},
-            {label:"📈 OIL $",  value:`$${oilPrice}/bbl`,                cls:oilPrice>OIL_BASE_PRICE?"text-green-400 font-bold":"text-white/60"},
-            {label:"⛽ FUEL $", value:`$${fuelPrice}/u`,                 cls:fuelPrice>FUEL_BASE_PRICE?"text-red-400 font-bold":"text-white/60"},
-          ].map(({label,value,cls})=>(
-            <div key={label} className="flex justify-between text-[10px]">
-              <span className="text-white/40">{label}</span><span className={cls}>{value}</span>
+          <button
+            onClick={() => setShowFlagSelector(true)}
+            title="Change flag / region"
+            className="text-2xl leading-none hover:scale-110 transition-transform shrink-0"
+          >
+            {displayFlag}
+          </button>
+          <div className="min-w-0">
+            <div className="text-white text-[11px] font-bold leading-tight truncate max-w-[80px]">{user.displayName ?? "Navigator"}</div>
+            <div className="flex items-center gap-1">
+              <span className="text-base leading-none">{levelInfo.badge}</span>
+              <span className="text-[9px] font-bold" style={{color: levelInfo.color}}>{levelInfo.title}</span>
             </div>
-          ))}
+          </div>
         </div>
-        {outgoingFuelReq && (
-          <div className="mt-2 pt-2 border-t border-cyan-500/30 text-[10px] text-cyan-400 animate-pulse">
-            ⛽ Waiting for {outgoingFuelReq.toName}…
+
+        {/* XP bar */}
+        <div className="w-16 shrink-0 hidden sm:block">
+          <div className="flex justify-between text-[8px] text-white/30 mb-0.5">
+            <span>{xp}</span>
+            <span>⭐{reputation}</span>
+          </div>
+          <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
+            <div className="h-full rounded-full transition-all" style={{ width:`${Math.round(levelInfo.progress*100)}%`, backgroundColor: levelInfo.color }} />
+          </div>
+        </div>
+
+        <div className="w-px h-8 bg-white/10 hidden sm:block" />
+
+        {/* Fuel */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span className="text-[10px] text-white/40">⛽</span>
+          <div className="w-12">
+            <div className="text-xs font-bold leading-none" style={{color: fuelColor}}>{fuel}%</div>
+            <div className="h-1 bg-white/10 rounded-full overflow-hidden mt-0.5">
+              <div className="h-full rounded-full transition-all" style={{width:`${fuel}%`, backgroundColor: fuelColor}} />
+            </div>
+          </div>
+        </div>
+
+        {/* Economy */}
+        <div className="flex items-center gap-3 shrink-0">
+          <div className="text-center">
+            <div className="text-[8px] text-white/30">MONEY</div>
+            <div className="text-yellow-300 text-xs font-bold">${money.toLocaleString()}</div>
+          </div>
+          <div className="text-center hidden sm:block">
+            <div className="text-[8px] text-white/30">CARGO</div>
+            <div className="text-amber-400 text-xs font-bold">🛢{oilBarrels}</div>
+          </div>
+          <div className="text-center hidden sm:block">
+            <div className="text-[8px] text-white/30">TRANSIT</div>
+            <div className="text-green-400 text-xs font-bold">✓{myTransits}</div>
+          </div>
+          <div className="text-center hidden md:block">
+            <div className="text-[8px] text-white/30">ONLINE</div>
+            <div className="text-blue-300 text-xs font-bold">👥{playerCount}</div>
+          </div>
+        </div>
+
+        {/* Market prices — only when events active */}
+        {gameEvent && (
+          <div className={`hidden md:flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-bold border animate-pulse
+            ${gameEvent.type==="fuel_crisis"?"bg-red-900/60 border-red-500/50 text-red-300":
+              gameEvent.type==="oil_spike"?"bg-green-900/60 border-green-500/50 text-green-300":
+              "bg-blue-900/60 border-blue-400/50 text-blue-200"}`}>
+            {gameEvent.type==="fuel_crisis"?"⚠️ FUEL CRISIS":
+             gameEvent.type==="oil_spike"?"📈 OIL SPIKE":"🌊 STORM"}
           </div>
         )}
-        <button onClick={()=>signOutUser()} className="mt-2 w-full text-[10px] text-white/25 hover:text-white/55 border border-white/10 hover:border-white/25 rounded px-2 py-1 transition-colors">Sign Out</button>
+
+        {outgoingFuelReq && (
+          <div className="hidden sm:flex items-center gap-1 text-cyan-400 text-[10px] animate-pulse shrink-0">
+            ⛽ Waiting…
+          </div>
+        )}
+
+        {/* Spacer */}
+        <div className="flex-1" />
+
+        {/* Signal dot */}
+        <div className={`w-2 h-2 rounded-full shrink-0 ${connected?"bg-green-400":"bg-red-400 animate-pulse"}`} title={connected?"Online":"Offline"} />
+
+        {/* Action buttons */}
+        <button
+          onClick={() => { setShowQuests(v => !v); setShowLeaderboard(false); }}
+          className={`relative flex items-center gap-1 text-[11px] px-3 py-1.5 rounded-lg border transition-colors shrink-0
+            ${showQuests ? "bg-yellow-500/20 border-yellow-400/50 text-yellow-300" : "bg-white/5 border-white/10 text-white/60 hover:text-white/90"}`}
+        >
+          📋
+          <span className="hidden sm:inline">Quests</span>
+          {questsUnclaimed > 0 && (
+            <span className="absolute -top-1 -right-1 bg-yellow-400 text-black text-[9px] font-bold rounded-full w-4 h-4 flex items-center justify-center">{questsUnclaimed}</span>
+          )}
+        </button>
+
+        <button
+          onClick={() => { setShowLeaderboard(v => !v); setShowQuests(false); }}
+          className={`flex items-center gap-1 text-[11px] px-3 py-1.5 rounded-lg border transition-colors shrink-0
+            ${showLeaderboard ? "bg-yellow-500/20 border-yellow-400/50 text-yellow-300" : "bg-white/5 border-white/10 text-white/60 hover:text-white/90"}`}
+        >
+          🏆
+        </button>
+
+        <button
+          onClick={() => signOutUser()}
+          className="text-[11px] px-3 py-1.5 rounded-lg border border-white/10 bg-white/5 text-white/40 hover:text-white/70 hover:border-white/25 transition-colors shrink-0"
+          title="Sign out"
+        >
+          ⏏
+        </button>
       </div>
 
-      {/* ── Controls ── */}
-      <div className="absolute top-3 right-3 bg-black/82 border border-white/15 rounded-lg px-4 py-3 text-white font-mono text-xs backdrop-blur-sm hidden sm:block">
-        <div className="text-yellow-400 font-bold mb-2 tracking-widest text-[11px]">CONTROLS</div>
-        <div className="space-y-1.5 text-white/60">
-          {[["Tap/Click","Move ship"],["W/↑","Forward"],["S/↓","Reverse"],["A D/←→","Turn"],["Scroll/Pinch","Zoom"]].map(([k,d])=>(
-            <div key={k} className="flex gap-3 items-center"><span className="text-white/35 w-16 text-right shrink-0">{k}</span><span>{d}</span></div>
-          ))}
-        </div>
-        <div className="mt-2 pt-2 border-t border-white/10 text-white/30 text-[10px]">Load 🛢 east → deliver west</div>
-      </div>
+      {/* ── Quest panel ── */}
+      {showQuests && (
+        <QuestPanel
+          questState={questState}
+          onClaim={claimQuest}
+          onClose={() => setShowQuests(false)}
+        />
+      )}
 
-      {/* ── Leaderboard ── */}
-      {topPlayers.length > 0 && (
-        <div className="absolute top-3 left-1/2 -translate-x-1/2 bg-black/82 border border-white/15 rounded-lg px-4 py-3 text-white font-mono backdrop-blur-sm">
-          <div className="text-yellow-400 font-bold text-[11px] tracking-widest mb-2 text-center">🏆 TOP NAVIGATORS</div>
-          <div className="space-y-1">
-            {topPlayers.map((p,i)=>(
-              <div key={p.name} className="flex items-center gap-3 text-xs">
-                <span className="text-white/30 w-4 text-right">{i+1}</span>
-                <div className="w-2 h-2 rounded-full shrink-0" style={{backgroundColor:p.color}} />
-                <span className="text-white/70 truncate max-w-[100px]">{p.name}</span>
-                <span className="text-green-400 font-bold ml-auto">✓{p.transits}</span>
+      {/* ── Leaderboard panel ── */}
+      {showLeaderboard && topPlayers.length > 0 && (
+        <div className="absolute top-16 right-4 z-30 w-60 bg-[#0a1f3a]/97 border border-white/15 rounded-2xl shadow-2xl font-mono backdrop-blur-sm overflow-hidden">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+            <div className="text-yellow-400 font-bold tracking-widest text-[11px]">🏆 TOP NAVIGATORS</div>
+            <button onClick={() => setShowLeaderboard(false)} className="text-white/30 hover:text-white/70 text-base leading-none">✕</button>
+          </div>
+          <div className="p-3 space-y-2">
+            {topPlayers.map((p, i) => (
+              <div key={p.name} className="flex items-center gap-3">
+                <span className="text-white/25 text-xs w-4 text-right shrink-0">{i+1}</span>
+                <div className="w-2.5 h-2.5 rounded-full shrink-0" style={{backgroundColor: p.color}} />
+                <span className="text-white/70 text-xs truncate flex-1">{p.name}</span>
+                <span className="text-green-400 text-xs font-bold shrink-0">✓{p.transits}</span>
               </div>
             ))}
+          </div>
+          <div className="px-4 pb-3">
+            <div className="text-[9px] text-white/20 text-center">Ranked by transits</div>
           </div>
         </div>
       )}
 
-      {/* ── Game event banner ── */}
-      {gameEvent && (
-        <div className={`absolute top-16 left-1/2 -translate-x-1/2 px-6 py-2 rounded-full font-mono text-sm font-bold border animate-pulse backdrop-blur-sm
-          ${gameEvent.type==="fuel_crisis"?"bg-red-900/80 border-red-500 text-red-300":
-            gameEvent.type==="oil_spike"?"bg-green-900/80 border-green-500 text-green-300":
-            "bg-blue-900/80 border-blue-400 text-blue-200"}`}>
-          {gameEvent.type==="fuel_crisis"?"⚠️ FUEL CRISIS — Prices Tripled!":
-           gameEvent.type==="oil_spike"?"📈 OIL PRICE SPIKE — Sell Now!":
-           "🌊 STORM — Speed Reduced!"}
+      {/* ── Flag selector modal ── */}
+      {showFlagSelector && (
+        <FlagSelector
+          currentFlag={displayFlag}
+          onSelect={handleFlagSelect}
+          onClose={() => setShowFlagSelector(false)}
+        />
+      )}
+
+      {/* ── Nation bonus banner (shown briefly) ── */}
+      {nation && (
+        <div className="absolute top-16 left-3 z-10 pointer-events-none">
+          <div className="bg-black/60 border border-amber-400/20 text-amber-400/80 text-[9px] font-mono rounded-lg px-2 py-1">
+            {nation.bonusLabel}
+          </div>
         </div>
       )}
 
       {/* ── Incoming fuel request modal ── */}
       {incomingFuelReq && (
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-black/94 border border-cyan-400/40 rounded-2xl px-8 py-6 font-mono text-white shadow-2xl backdrop-blur-sm z-50 text-center w-72">
+          <button onClick={() => setIncomingFuelReq(null)} className="absolute top-3 right-4 text-white/25 hover:text-white/60 text-sm">✕</button>
           <div className="text-3xl mb-3">⛽</div>
           <div className="text-cyan-300 font-bold text-base mb-1">Fuel Request</div>
           <div className="text-white/70 text-sm mb-1">{incomingFuelReq.fromFlag} <span className="text-white font-bold">{incomingFuelReq.fromName}</span></div>
@@ -1131,7 +1219,7 @@ export default function GameCanvas({ user }: Props) {
       )}
 
       {/* ── Announcements ── */}
-      <div className="absolute bottom-16 left-1/2 -translate-x-1/2 flex flex-col gap-2 items-center pointer-events-none">
+      <div className="absolute bottom-16 left-1/2 -translate-x-1/2 flex flex-col gap-2 items-center pointer-events-none z-10">
         {announcements.map(a=>(
           <div key={a.id} className="bg-black/85 border border-cyan-500/30 text-cyan-200 font-mono text-sm px-5 py-2 rounded-full whitespace-nowrap">
             {a.text}
@@ -1139,16 +1227,15 @@ export default function GameCanvas({ user }: Props) {
         ))}
       </div>
 
-      {/* ── Map position hover tooltip (distance + ETA) ── */}
+      {/* ── Map hover tooltip ── */}
       {mapHover && !hoverInfo && (
         <div
           className="absolute pointer-events-none z-20 font-mono"
-          style={{ left: Math.min(mapHover.screenX + 16, window.innerWidth - 180), top: Math.max(mapHover.screenY - 52, 8) }}
+          style={{ left: Math.min(mapHover.screenX + 16, window.innerWidth - 180), top: Math.max(mapHover.screenY - 52, 64) }}
         >
           <div className="bg-black/80 border border-yellow-400/40 rounded-lg px-3 py-2 text-[11px] leading-5 shadow-xl backdrop-blur-sm">
             <div className="flex items-center gap-1.5 text-yellow-300 font-bold mb-0.5">
-              <span>📍</span>
-              <span>Click to navigate</span>
+              <span>📍</span><span>Click to navigate</span>
             </div>
             <div className="flex gap-3 text-white/70">
               <span>⬛ <span className="text-white">{mapHover.distKm} km</span></span>
@@ -1158,10 +1245,10 @@ export default function GameCanvas({ user }: Props) {
         </div>
       )}
 
-      {/* ── Hover tooltip ── */}
+      {/* ── Ship hover tooltip ── */}
       {hoverInfo && (
         <div className="absolute pointer-events-none z-30 bg-black/92 border border-white/20 rounded-xl p-3 w-56 font-mono shadow-2xl backdrop-blur-sm"
-             style={{left:Math.min(hoverPos.x+14,window.innerWidth-232), top:Math.max(hoverPos.y-10,8)}}>
+             style={{left:Math.min(hoverPos.x+14,window.innerWidth-232), top:Math.max(hoverPos.y-10,64)}}>
           <div className="flex items-center gap-2 mb-2">
             {hoverInfo.photoURL
               ? <img src={hoverInfo.photoURL} alt="" className="w-9 h-9 rounded-full border-2" style={{borderColor:hoverInfo.color}} />
@@ -1180,7 +1267,6 @@ export default function GameCanvas({ user }: Props) {
               <div className="flex justify-between"><span className="text-white/40">Fuel</span><span style={{color:(hoverInfo.fuel??0)>50?"#4ade80":(hoverInfo.fuel??0)>25?"#facc15":"#f87171"}}>{hoverInfo.fuel}%</span></div>
               {hoverInfo.bonus && <div className="text-amber-400/80 text-[10px] pt-1 border-t border-white/10">{hoverInfo.bonus}</div>}
             </>}
-            {/* Fuel request button for nearby players */}
             {!hoverInfo.isBot && !hoverInfo.isSelf && hoverInfo.uid && (
               <div className="pt-1 border-t border-white/10">
                 {hoverInfo.canRequestFuel ? (
@@ -1200,16 +1286,11 @@ export default function GameCanvas({ user }: Props) {
         </div>
       )}
 
-      {/* ── Mobile touch joystick hint ── */}
-      <div className="absolute bottom-20 left-3 text-white/25 font-mono text-[10px] sm:hidden">
-        Tap water to move · Pinch to zoom
-      </div>
-
       {/* ── Chat ── */}
       <Chat
         socketRef={socketRef}
         playerName={user.displayName ?? "Navigator"}
-        playerFlag={nation?.flag ?? "🏳️"}
+        playerFlag={displayFlag}
         myUid={user.uid}
         onFuelRequestNearest={requestFuelNearest}
         onFuelRespond={respondFuel}
@@ -1226,14 +1307,18 @@ export default function GameCanvas({ user }: Props) {
           </div>
         </div>
       )}
+
+      {/* ── Mobile hint ── */}
+      <div className="absolute bottom-20 left-3 text-white/20 font-mono text-[10px] sm:hidden pointer-events-none">
+        Tap water to move · Pinch to zoom
+      </div>
     </div>
   );
 }
 
-// ── Dynamic minimum zoom — prevents going outside map bounds ──────────────────
+// ── Dynamic minimum zoom ──────────────────────────────────────────────────────
 function getDynMinZoom(canvas: HTMLCanvasElement): number {
   const byWidth  = canvas.width  / MAP_WIDTH;
   const byHeight = canvas.height / MAP_HEIGHT;
-  // Use the larger of the two so the map always fills the screen in at least one dimension
   return Math.max(byWidth, byHeight, ZOOM_MIN) * 0.94;
 }

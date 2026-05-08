@@ -20,7 +20,7 @@ function toFlagEmoji(code: string): string {
   return [...code.toUpperCase()].map(c => String.fromCodePoint(0x1F1E6 + c.charCodeAt(0) - 65)).join("");
 }
 
-function mapCountry(code: string, name: string): Nation {
+export function mapCountry(code: string, name: string): Nation {
   let bonus: BonusType;
   let bonusLabel: string;
   let profitMult: number;
