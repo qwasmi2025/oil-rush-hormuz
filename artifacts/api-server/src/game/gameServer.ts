@@ -8,6 +8,7 @@ interface PlayerState {
   name: string; photoURL: string | null;
   transits: number; color: string; flag: string;
   frozen: boolean; frozenUntil: number;
+  fuelLow: boolean;
 }
 interface BotState {
   id: string; name: string; flag: string; color: string;
@@ -21,20 +22,21 @@ interface GameEvent { type: "fuel_crisis" | "storm" | "oil_spike"; expiresAt: nu
 interface FuelRequest { id: string; fromSocketId: string; fromName: string; fromFlag: string; toSocketId: string; expiresAt: number; }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const TICK_MS        = 100;
-const BOT_SPEED      = 1.4;
-const CG_SPEED       = 1.1;
-const MINE_RADIUS    = 22;
-const CG_RADIUS      = 38;
-const MINE_FREEZE_MS = 10_000;
-const CG_FREEZE_MS   = 24_000;
-const EVENT_INTERVAL = 70_000;
-const EVENT_DURATION = 28_000;
-const FUEL_REQ_EXPIRY = 20_000;
-const FUEL_AMOUNT    = 30;
-const FUEL_COST      = 150; // $ deducted from requester, paid to sender
+const TICK_MS         = 100;
+// Bot speed per tick (10 ticks/s) → 0.9 px/tick = 9 px/s ≈ player max speed
+const BOT_SPEED       = 0.9;
+const CG_SPEED        = 0.7;
+const MINE_RADIUS     = 22;
+const CG_RADIUS       = 38;
+const MINE_FREEZE_MS  = 10_000;
+const CG_FREEZE_MS    = 24_000;
+const EVENT_INTERVAL  = 70_000;
+const EVENT_DURATION  = 28_000;
+const FUEL_REQ_EXPIRY = 25_000;
+const FUEL_AMOUNT     = 30;
+const FUEL_COST       = 150;
 
-// Updated waypoints matching new map geography (through the strait channel)
+// Waypoints through the strait channel
 const WAYPOINTS: [number, number][] = [
   [100, 740],  [350, 728],  [600, 715],  [900, 702],  [1200, 688],
   [1450, 672], [1700, 657], [1900, 648], [2100, 638], [2350, 645],
@@ -50,7 +52,6 @@ const bots: BotState[] = [
   { id:"bot_2", name:"MV Al-Khaleej", flag:"🏳️", color:"#ffd700", yOff: 55, waypointIdx:8,  direction:-1, x:WAYPOINTS[8][0],  y:WAYPOINTS[8][1]+55,  rotation:0, frozen:false, frozenUntil:0 },
 ];
 
-// Updated mine positions matching new map's water channel
 const mines: Mine[] = [
   { id:"m0", x:430,  y:742, defused:false },
   { id:"m1", x:682,  y:720, defused:false },
@@ -78,14 +79,18 @@ function getInitData() {
   };
 }
 
+function dist(ax: number, ay: number, bx: number, by: number) {
+  return Math.sqrt((ax-bx)**2 + (ay-by)**2);
+}
+
 function updateBots(io: Server, now: number) {
   for (const bot of bots) {
     if (bot.frozen) { if (now > bot.frozenUntil) bot.frozen = false; else continue; }
     const wp = WAYPOINTS[bot.waypointIdx];
     const tx = wp[0], ty = wp[1] + bot.yOff;
     const dx = tx - bot.x, dy = ty - bot.y;
-    const dist = Math.sqrt(dx*dx + dy*dy);
-    if (dist < 15) {
+    const d = Math.sqrt(dx*dx + dy*dy);
+    if (d < 15) {
       const next = bot.waypointIdx + bot.direction;
       if (next < 0 || next >= WAYPOINTS.length) bot.direction = bot.direction === 1 ? -1 : 1;
       else bot.waypointIdx = next;
@@ -117,7 +122,7 @@ function updateCoastGuard(io: Server) {
 function checkCoastGuardPlayers(io: Server, now: number) {
   for (const [, p] of players) {
     if (p.frozen) { if (now > p.frozenUntil) p.frozen = false; else continue; }
-    if (Math.sqrt((p.x-coastGuard.x)**2+(p.y-coastGuard.y)**2) < CG_RADIUS) {
+    if (dist(p.x, p.y, coastGuard.x, coastGuard.y) < CG_RADIUS) {
       p.frozen = true; p.frozenUntil = now + CG_FREEZE_MS;
       io.to(p.id).emit("player:arrested", { duration: CG_FREEZE_MS });
     }
@@ -165,7 +170,7 @@ export function initGameServer(io: Server): void {
       name: a.name ?? `Navigator ${Math.floor(Math.random()*999)}`,
       photoURL: a.photoURL ?? null, color: a.color ?? "#4ade80",
       flag: a.flag ?? "🏳️", transits: a.transits ?? 0,
-      frozen: false, frozenUntil: 0, ...savedPos,
+      frozen: false, frozenUntil: 0, fuelLow: false, ...savedPos,
     };
     players.set(socket.id, player);
     logger.info({ uid: player.uid, name: player.name, total: players.size }, "Player connected");
@@ -200,21 +205,37 @@ export function initGameServer(io: Server): void {
       if (p) { p.frozen=true; p.frozenUntil=Date.now()+MINE_FREEZE_MS; socket.emit("player:frozen", { duration:MINE_FREEZE_MS, reason:"mine" }); }
     });
 
-    // ── Fuel transfer ─────────────────────────────────────────────────────────
+    // ── Fuel low indicator ─────────────────────────────────────────────────────
+    socket.on("player:fuel_low", () => {
+      const p = players.get(socket.id);
+      if (p && !p.fuelLow) { p.fuelLow = true; socket.broadcast.emit("player:fuel_low", { uid: p.uid }); }
+    });
+    socket.on("player:fuel_ok", () => {
+      const p = players.get(socket.id);
+      if (p && p.fuelLow) { p.fuelLow = false; socket.broadcast.emit("player:fuel_ok", { uid: p.uid }); }
+    });
+
+    // ── Fuel transfer ──────────────────────────────────────────────────────────
+    // Request by UID (from hover tooltip)
     socket.on("fuel:request", ({ toUid }: { toUid: string }) => {
       const target = [...players.values()].find(p => p.uid === toUid && p.id !== socket.id);
-      if (!target) { socket.emit("fuel:request_failed", { reason: "Player not found" }); return; }
-      const reqId = `fr_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      const req: FuelRequest = { id:reqId, fromSocketId:socket.id, fromName:player.name, fromFlag:player.flag, toSocketId:target.id, expiresAt:Date.now()+FUEL_REQ_EXPIRY };
-      fuelRequests.set(reqId, req);
-      io.to(target.id).emit("fuel:request_incoming", { requestId:reqId, fromName:player.name, fromFlag:player.flag });
-      socket.emit("fuel:request_sent", { requestId:reqId, toName:target.name });
-      setTimeout(() => {
-        if (fuelRequests.has(reqId)) {
-          fuelRequests.delete(reqId);
-          io.to(socket.id).emit("fuel:request_expired", { requestId:reqId });
-        }
-      }, FUEL_REQ_EXPIRY);
+      sendFuelRequest(socket, io, player, target);
+    });
+
+    // Request nearest player (from chat ⛽ button)
+    socket.on("fuel:request_nearest", () => {
+      const others = [...players.values()].filter(p => p.id !== socket.id);
+      if (others.length === 0) { socket.emit("fuel:request_failed", { reason: "No other players online" }); return; }
+      const nearest = others.reduce((a, b) =>
+        dist(player.x, player.y, a.x, a.y) < dist(player.x, player.y, b.x, b.y) ? a : b
+      );
+      sendFuelRequest(socket, io, player, nearest);
+      // Broadcast to all so everyone sees the request in chat
+      io.emit("chat:message", {
+        uid: player.uid, name: player.name, flag: player.flag,
+        text: `⛽ ${player.name} is requesting fuel from ${nearest.name}!`,
+        isSystem: true, ts: Date.now(),
+      });
     });
 
     socket.on("fuel:respond", ({ requestId, accept }: { requestId: string; accept: boolean }) => {
@@ -241,4 +262,22 @@ export function initGameServer(io: Server): void {
       logger.info({ socketId:socket.id, total:players.size }, "Player disconnected");
     });
   });
+}
+
+function sendFuelRequest(socket: Socket, io: Server, player: PlayerState, target: PlayerState | undefined) {
+  if (!target) { socket.emit("fuel:request_failed", { reason: "Player not found" }); return; }
+  const reqId = `fr_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const req: FuelRequest = {
+    id: reqId, fromSocketId: socket.id, fromName: player.name,
+    fromFlag: player.flag, toSocketId: target.id, expiresAt: Date.now() + FUEL_REQ_EXPIRY,
+  };
+  fuelRequests.set(reqId, req);
+  io.to(target.id).emit("fuel:request_incoming", { requestId:reqId, fromName:player.name, fromFlag:player.flag });
+  socket.emit("fuel:request_sent", { requestId:reqId, toName:target.name });
+  setTimeout(() => {
+    if (fuelRequests.has(reqId)) {
+      fuelRequests.delete(reqId);
+      io.to(socket.id).emit("fuel:request_expired", { requestId:reqId });
+    }
+  }, FUEL_REQ_EXPIRY);
 }

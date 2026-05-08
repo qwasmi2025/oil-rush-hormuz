@@ -8,6 +8,7 @@ import {
 } from "@/firebase/gameState";
 import { detectNation, type Nation } from "./nations";
 import Chat from "@/components/Chat";
+import { getLevelInfo, type ComputedLevel, XP_TRANSIT, XP_OIL, XP_FUEL_GIVEN, REP_TRANSIT, REP_OIL, REP_FUEL_GIVEN } from "./levels";
 import {
   MAP_WIDTH, MAP_HEIGHT, SHIP_LENGTH, SHIP_WIDTH,
   MAX_SPEED, REVERSE_SPEED, ACCELERATION, DRAG,
@@ -97,6 +98,12 @@ export default function GameCanvas({ user }: Props) {
   const myColorRef = useRef(colorFromUid(user.uid));
   const nationRef = useRef<Nation | null>(null);
   const pinchDistRef = useRef(0);
+  const xpRef = useRef(0);
+  const reputationRef = useRef(0);
+  const levelInfoRef = useRef<ComputedLevel>(getLevelInfo(0));
+  // Set of remote player UIDs with low fuel (for canvas icon)
+  const lowFuelUidsRef = useRef<Set<string>>(new Set());
+  const fuelLowEmittedRef = useRef(false);
 
   // Economy refs
   const fuelRef = useRef<number>(FUEL_CAPACITY);
@@ -130,10 +137,13 @@ export default function GameCanvas({ user }: Props) {
   const [hoverInfo, setHoverInfo] = useState<HoverInfo | null>(null);
   const [hoverPos, setHoverPos] = useState({ x: 0, y: 0 });
   const [mapHover, setMapHover] = useState<{ distKm: number; eta: string; screenX: number; screenY: number } | null>(null);
-  const [topPlayers, setTopPlayers] = useState<{ name: string; transits: number; color: string }[]>([]);
+  const [topPlayers, setTopPlayers] = useState<{ name: string; transits: number; color: string; xp: number }[]>([]);
   const [incomingFuelReq, setIncomingFuelReq] = useState<IncomingFuelReq | null>(null);
   const [outgoingFuelReq, setOutgoingFuelReq] = useState<OutgoingFuelReq | null>(null);
   const [incomingTimer, setIncomingTimer] = useState(0);
+  const [xp, setXp] = useState(0);
+  const [reputation, setReputation] = useState(0);
+  const [levelInfo, setLevelInfo] = useState<ComputedLevel>(getLevelInfo(0));
 
   const addAnn = useCallback((text: string) => {
     const id = annIdRef.current++;
@@ -165,7 +175,7 @@ export default function GameCanvas({ user }: Props) {
       for (const p of players) map.set(p.uid, p);
       firestorePlayersRef.current = map;
       const sorted = [...players].sort((a, b) => (b.transits??0)-(a.transits??0)).slice(0,5);
-      setTopPlayers(sorted.map(p => ({ name: p.displayName, transits: p.transits??0, color: p.color })));
+      setTopPlayers(sorted.map(p => ({ name: p.displayName, transits: p.transits??0, color: p.color, xp: p.xp??0 })));
     });
     return unsub;
   }, []);
@@ -315,13 +325,15 @@ export default function GameCanvas({ user }: Props) {
 
     const onUnload = () => {
       const s = selfRef.current; if (!s) return;
-      savePlayerState(user.uid, { displayName:user.displayName??"", photoURL:user.photoURL, x:s.x, y:s.y, rotation:s.rotation, transits:s.transits, color:myColorRef.current });
+      savePlayerState(user.uid, { displayName:user.displayName??"", photoURL:user.photoURL, x:s.x, y:s.y, rotation:s.rotation, transits:s.transits, color:myColorRef.current, xp:xpRef.current, reputation:reputationRef.current });
     };
     window.addEventListener("beforeunload", onUnload);
 
     // Socket connection
     loadPlayerState(user.uid).then(saved => {
       if (saved?.color) myColorRef.current = saved.color;
+      if (saved?.xp) { xpRef.current=saved.xp; setXp(saved.xp); const li=getLevelInfo(saved.xp); levelInfoRef.current=li; setLevelInfo(li); }
+      if (saved?.reputation) { reputationRef.current=saved.reputation; setReputation(saved.reputation); }
       const socketAuth: Record<string, unknown> = {
         uid: user.uid, name: user.displayName??"Navigator",
         photoURL: user.photoURL??null, color: myColorRef.current,
@@ -376,9 +388,15 @@ export default function GameCanvas({ user }: Props) {
       socket.on("player:transited", (d: {id:string;uid:string;name:string;transits:number}) => {
         if (socket.id===d.id) {
           setMyTransits(d.transits);
-          const s=selfRef.current; if(s) { s.transits=d.transits; savePlayerState(user.uid,{displayName:user.displayName??"",photoURL:user.photoURL,x:s.x,y:s.y,rotation:s.rotation,transits:d.transits,color:myColorRef.current}); }
+          // Award XP + reputation for transit
+          xpRef.current+=XP_TRANSIT; reputationRef.current+=REP_TRANSIT;
+          setXp(xpRef.current); setReputation(reputationRef.current);
+          const li=getLevelInfo(xpRef.current); const prevLvl=levelInfoRef.current.level;
+          levelInfoRef.current=li; setLevelInfo(li);
+          if (li.level>prevLvl) addAnn(`🎖️ Level Up! ${li.badge} ${li.title} (${li.titleAr})`);
+          const s=selfRef.current; if(s) { s.transits=d.transits; savePlayerState(user.uid,{displayName:user.displayName??"",photoURL:user.photoURL,x:s.x,y:s.y,rotation:s.rotation,transits:d.transits,color:myColorRef.current,xp:xpRef.current,reputation:reputationRef.current}); }
         }
-        addAnn(`✓ ${d.name} completed transit #${d.transits}!`);
+        addAnn(`✓ ${d.name} completed transit #${d.transits}! (+${XP_TRANSIT} XP)`);
       });
       socket.on("player:reset", (pos: {x:number;y:number;rotation:number}) => {
         const s=selfRef.current; if(!s) return;
@@ -408,6 +426,10 @@ export default function GameCanvas({ user }: Props) {
       });
 
       // ── Fuel transfer ──────────────────────────────────────────────────────
+      // ── Fuel low indicators for remote ships ─────────────────────────────────
+      socket.on("player:fuel_low", ({ uid }: { uid: string }) => { lowFuelUidsRef.current.add(uid); });
+      socket.on("player:fuel_ok",  ({ uid }: { uid: string }) => { lowFuelUidsRef.current.delete(uid); });
+
       socket.on("fuel:request_incoming", (d: IncomingFuelReq) => {
         setIncomingFuelReq(d);
         addAnn(`⛽ ${d.fromFlag} ${d.fromName} requests fuel!`);
@@ -430,11 +452,17 @@ export default function GameCanvas({ user }: Props) {
         moneyRef.current += payment;
         setMoney(moneyRef.current);
         setIncomingFuelReq(null);
-        addAnn(`⛽ Sent ${amount} fuel — earned $${payment}`);
+        // Award XP + reputation for helping with fuel
+        xpRef.current+=XP_FUEL_GIVEN; reputationRef.current+=REP_FUEL_GIVEN;
+        setXp(xpRef.current); setReputation(reputationRef.current);
+        const li=getLevelInfo(xpRef.current); const prevLvl=levelInfoRef.current.level;
+        levelInfoRef.current=li; setLevelInfo(li);
+        if (li.level>prevLvl) addAnn(`🎖️ Level Up! ${li.badge} ${li.title}`);
+        addAnn(`⛽ Sent ${amount} fuel — earned $${payment} · +${XP_FUEL_GIVEN} XP`);
       });
       socket.on("fuel:request_declined",  () => { setOutgoingFuelReq(null); addAnn("⛽ Fuel request declined"); });
       socket.on("fuel:request_expired",   () => { setOutgoingFuelReq(null); addAnn("⛽ Fuel request expired"); });
-      socket.on("fuel:request_failed",    () => { setOutgoingFuelReq(null); addAnn("⛽ Could not reach that player"); });
+      socket.on("fuel:request_failed",    (d?: {reason?:string}) => { setOutgoingFuelReq(null); addAnn(`⛽ ${d?.reason ?? "No players nearby"}`); });
     });
 
     function applyEvent(e: GameEvent) {
@@ -486,7 +514,7 @@ export default function GameCanvas({ user }: Props) {
       }
     }
 
-    function drawShip(x:number,y:number,rot:number,color:string,name:string,transits:number,flag:string,isSelf:boolean,speed:number,frozen:boolean) {
+    function drawShip(x:number,y:number,rot:number,color:string,name:string,transits:number,flag:string,isSelf:boolean,speed:number,frozen:boolean,levelBadge?:string,isLowFuel?:boolean) {
       const L=SHIP_LENGTH, W=SHIP_WIDTH;
       ctx.save(); ctx.translate(x,y); ctx.rotate(rot);
       if (frozen) ctx.globalAlpha=0.72;
@@ -517,8 +545,14 @@ export default function GameCanvas({ user }: Props) {
       ctx.save(); ctx.font="bold 11px 'Courier New',monospace"; ctx.textAlign="center";
       ctx.fillStyle="rgba(0,0,0,0.45)"; ctx.fillText(name,x+1,y-L/2-8);
       ctx.fillStyle=isSelf?"rgba(255,255,200,0.95)":"rgba(200,230,255,0.85)"; ctx.fillText(name,x,y-L/2-9);
-      if (flag&&flag!=="🏳️") { ctx.font="14px serif"; ctx.fillText(flag,x,y-L/2-23); }
-      if (transits>0) { ctx.font="bold 10px monospace"; ctx.fillStyle="#4ade80"; ctx.fillText(`✓${transits}`,x+(flag&&flag!=="🏳️"?18:0),y-L/2-23); }
+      if (flag&&flag!=="🏳️") { ctx.font="14px serif"; ctx.fillText(flag,x-12,y-L/2-23); }
+      if (levelBadge) { ctx.font="12px serif"; ctx.fillText(levelBadge,x+(flag&&flag!=="🏳️"?4:0),y-L/2-22); }
+      if (transits>0) { ctx.font="bold 10px monospace"; ctx.fillStyle="#4ade80"; ctx.fillText(`✓${transits}`,x+16,y-L/2-22); }
+      // Fuel low indicator — blinking ⛽ above ship
+      if (isLowFuel) {
+        const blink = Math.sin(Date.now()/240)*0.5+0.6;
+        ctx.globalAlpha=blink; ctx.font="13px serif"; ctx.fillText("⛽",x,y-L/2-37); ctx.globalAlpha=1;
+      }
       if (isSelf) {
         ctx.beginPath(); ctx.arc(x,y,L/2+6,0,Math.PI*2);
         ctx.strokeStyle="rgba(255,255,255,0.12)"; ctx.lineWidth=1; ctx.setLineDash([3,5]); ctx.stroke(); ctx.setLineDash([]);
@@ -694,6 +728,10 @@ export default function GameCanvas({ user }: Props) {
         const drain=FUEL_DRAIN*(nat?.fuelMult??1.0)*(stormRef.current?1.45:1.0);
         fuelRef.current=Math.max(0,fuelRef.current-drain);
         setFuel(Math.round(fuelRef.current));
+        // Broadcast fuel low/ok threshold to other players
+        const isLow = fuelRef.current < 30;
+        if (isLow && !fuelLowEmittedRef.current) { fuelLowEmittedRef.current=true; socketRef.current?.emit("player:fuel_low"); }
+        if (!isLow && fuelLowEmittedRef.current) { fuelLowEmittedRef.current=false; socketRef.current?.emit("player:fuel_ok"); }
       }
 
       // Wake trail
@@ -729,7 +767,13 @@ export default function GameCanvas({ user }: Props) {
         const earned=Math.floor(oilBarrelsRef.current*oilPriceRef.current*(nat?.profitMult??1.0));
         moneyRef.current+=earned; setMoney(moneyRef.current);
         oilBarrelsRef.current=0; setOilBarrels(0);
-        addAnn(`💰 Delivered! +$${earned.toLocaleString()} (${OIL_CARGO_MAX} bbls × $${oilPriceRef.current})`);
+        // Award XP + reputation for delivery
+        xpRef.current+=XP_OIL; reputationRef.current+=REP_OIL;
+        setXp(xpRef.current); setReputation(reputationRef.current);
+        const li=getLevelInfo(xpRef.current); const prevLvl=levelInfoRef.current.level;
+        levelInfoRef.current=li; setLevelInfo(li);
+        if (li.level>prevLvl) addAnn(`🎖️ Level Up! ${li.badge} ${li.title}`);
+        addAnn(`💰 Delivered! +$${earned.toLocaleString()} · +${XP_OIL} XP`);
       }
 
       // Fuel stations
@@ -757,7 +801,7 @@ export default function GameCanvas({ user }: Props) {
       }
       if (nowMs-lastSaveRef.current>30000) {
         lastSaveRef.current=nowMs;
-        savePlayerState(user.uid,{displayName:user.displayName??"",photoURL:user.photoURL,x:s.x,y:s.y,rotation:s.rotation,transits:s.transits,color:myColorRef.current});
+        savePlayerState(user.uid,{displayName:user.displayName??"",photoURL:user.photoURL,x:s.x,y:s.y,rotation:s.rotation,transits:s.transits,color:myColorRef.current,xp:xpRef.current,reputation:reputationRef.current});
       }
 
       // Lerp remotes
@@ -877,13 +921,17 @@ export default function GameCanvas({ user }: Props) {
       // Remote players' wakes then ships
       for (const r of remotesRef.current.values()) drawWake(r.wake);
       drawWake(selfWakeRef.current);
-      for (const r of remotesRef.current.values())
-        drawShip(r.x,r.y,r.rotation,r.color,r.name,r.transits,r.flag??"🏳️",false,Math.sqrt(r.vx**2+r.vy**2),false);
+      for (const r of remotesRef.current.values()) {
+        const isRLowFuel = lowFuelUidsRef.current.has(r.uid);
+        drawShip(r.x,r.y,r.rotation,r.color,r.name,r.transits,r.flag??"🏳️",false,Math.sqrt(r.vx**2+r.vy**2),false,undefined,isRLowFuel);
+      }
 
       // Self ship
       if (s) {
         const frozen=Date.now()<frozenUntilRef.current;
-        drawShip(s.x,s.y,s.rotation,myColorRef.current,s.name,s.transits,nationRef.current?.flag??"🏳️",true,Math.sqrt(s.vx**2+s.vy**2),frozen);
+        const selfLvlBadge=levelInfoRef.current.badge;
+        const selfLowFuel=fuelRef.current<30;
+        drawShip(s.x,s.y,s.rotation,myColorRef.current,s.name,s.transits,nationRef.current?.flag??"🏳️",true,Math.sqrt(s.vx**2+s.vy**2),frozen,selfLvlBadge,selfLowFuel);
         if (oilBarrelsRef.current>0) {
           ctx.save(); ctx.font="bold 11px monospace"; ctx.textAlign="center";
           ctx.fillStyle="#ca8a04"; ctx.fillText(`🛢${oilBarrelsRef.current}`,s.x,s.y-SHIP_LENGTH/2-38); ctx.restore();
@@ -909,6 +957,11 @@ export default function GameCanvas({ user }: Props) {
     socketRef.current?.emit("fuel:request", { toUid: targetUid });
   }, [outgoingFuelReq]);
 
+  const requestFuelNearest = useCallback(() => {
+    if (outgoingFuelReq) { return; }
+    socketRef.current?.emit("fuel:request_nearest");
+  }, [outgoingFuelReq]);
+
   const respondFuel = useCallback((requestId: string, accept: boolean) => {
     socketRef.current?.emit("fuel:respond", { requestId, accept });
     setIncomingFuelReq(null);
@@ -931,6 +984,30 @@ export default function GameCanvas({ user }: Props) {
           </div>
         </div>
         {nation && <div className="text-[10px] text-amber-400/80 mb-2 border border-amber-400/20 rounded px-2 py-1">{nation.bonusLabel}</div>}
+        {/* Level badge */}
+        <div className="flex items-center gap-2 mb-2 bg-white/5 rounded-lg px-2 py-1.5">
+          <span className="text-xl leading-none">{levelInfo.badge}</span>
+          <div className="flex-1 min-w-0">
+            <div className="text-[11px] font-bold" style={{ color: levelInfo.color }}>{levelInfo.title}</div>
+            <div className="text-[9px] text-white/35 truncate">{levelInfo.titleAr}</div>
+          </div>
+          <div className="text-right shrink-0">
+            <div className="text-[10px] text-cyan-300 font-bold">{xp} XP</div>
+            <div className="text-[9px] text-white/30">⭐{reputation}</div>
+          </div>
+        </div>
+        {/* XP progress bar */}
+        {levelInfo.xpToNext > 0 && (
+          <div className="mb-2">
+            <div className="flex justify-between text-[9px] text-white/30 mb-0.5">
+              <span>Level {levelInfo.level}</span>
+              <span>{levelInfo.xpToNext} XP to next</span>
+            </div>
+            <div className="h-1 bg-white/10 rounded-full overflow-hidden">
+              <div className="h-full rounded-full transition-all" style={{ width:`${Math.round(levelInfo.progress*100)}%`, backgroundColor: levelInfo.color }} />
+            </div>
+          </div>
+        )}
         <div className="text-xs space-y-1.5">
           {[
             {label:"CAPTAIN", value:user.displayName??"Navigator", cls:"text-cyan-300 truncate max-w-[110px]"},
@@ -1134,6 +1211,9 @@ export default function GameCanvas({ user }: Props) {
         playerName={user.displayName ?? "Navigator"}
         playerFlag={nation?.flag ?? "🏳️"}
         myUid={user.uid}
+        onFuelRequestNearest={requestFuelNearest}
+        onFuelRespond={respondFuel}
+        incomingFuelReq={incomingFuelReq}
       />
 
       {/* ── Connecting overlay ── */}

@@ -11,6 +11,8 @@ export interface PlayerDoc {
   photoURL: string | null;
   x: number; y: number; rotation: number;
   transits: number; color: string;
+  xp: number;
+  reputation: number;
   lastSeen?: unknown;
 }
 
@@ -49,6 +51,7 @@ export function subscribeToAllPlayers(callback: (players: PlayerDoc[]) => void):
 // ── Chat history (Firestore) ──────────────────────────────────────────────────
 export interface ChatRecord {
   uid: string; name: string; flag: string; text: string; ts?: unknown;
+  isFuelRequest?: boolean;
 }
 
 export async function saveChatMessage(msg: Omit<ChatRecord, "ts">): Promise<void> {
